@@ -1,0 +1,34 @@
+syntax = "proto3";
+package cloud_gaming;
+
+// Схема из раздела 2.3 архитектурного документа (v2.1).
+// Клавиатура и кнопки мыши передаются СОСТОЯНИЕМ (snapshot), а не событиями:
+// Input Injector сам считает разницу с предыдущим состоянием и генерирует
+// key-down (value=1) и key-up (value=0). Так потеря пакета не приводит к залипанию клавиш.
+message PlayerInput {
+  uint64 sequence = 1;
+  uint64 timestamp_ms = 2;
+
+  message KeyboardState {
+    repeated uint32 pressed_keys = 1; // Linux key codes (KEY_W = 17, etc.)
+  }
+
+  message MouseState {
+    int32 delta_x = 1;
+    int32 delta_y = 2;
+    uint32 button_mask = 3; // bit 0 = left, bit 1 = right, bit 2 = middle (состояние)
+    int32 wheel_delta = 4;
+  }
+
+  message GamepadState {
+    uint32 gamepad_id = 1;
+    repeated float axes = 2;    // -1.0 .. 1.0
+    repeated uint32 buttons = 3; // bit mask
+  }
+
+  oneof input {
+    KeyboardState keyboard = 10;
+    MouseState mouse = 11;
+    GamepadState gamepad = 12;
+  }
+}
