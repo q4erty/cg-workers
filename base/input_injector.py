@@ -42,20 +42,31 @@ from input_bridge import SOCK_PATH, load_proto
 log = logging.getLogger('input-injector')
 
 # --- Linux input-event-codes.h (сверяются с python-evdev при создании устройств) ---
-KEY_W, KEY_A, KEY_S, KEY_D, KEY_SPACE, KEY_LEFTSHIFT = 17, 30, 31, 32, 57, 42
 BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
 REL_X, REL_Y, REL_WHEEL = 0x00, 0x01, 0x08
 
-# Клавиши, которые умеет виртуальная клавиатура. Расширять — добавлением сюда
-# (и в KEYMAP на клиенте). Остальные коды игнорируются с одним предупреждением.
+# Клавиши, которые умеет виртуальная клавиатура (Linux key codes, input-event-codes.h).
+# Расширять — добавлением сюда (и в KEYMAP на клиенте). Остальные коды игнорируются
+# с одним предупреждением. Набор рассчитан на меню и геймплей Xonotic: движение,
+# стрельба, консоль/чат (~ и Enter), навигация в меню (Esc, стрелки, Tab), быстрое
+# переключение оружия (цифры).
 KEYBOARD_KEYS = {
-    KEY_W: 'KEY_W',
-    KEY_A: 'KEY_A',
-    KEY_S: 'KEY_S',
-    KEY_D: 'KEY_D',
-    KEY_SPACE: 'KEY_SPACE',
-    KEY_LEFTSHIFT: 'KEY_LEFTSHIFT',
+    17: 'KEY_W', 30: 'KEY_A', 31: 'KEY_S', 32: 'KEY_D',
+    57: 'KEY_SPACE', 42: 'KEY_LEFTSHIFT', 29: 'KEY_LEFTCTRL', 56: 'KEY_LEFTALT',
+    1: 'KEY_ESC', 28: 'KEY_ENTER', 15: 'KEY_TAB', 14: 'KEY_BACKSPACE',
+    41: 'KEY_GRAVE',  # ~  — консоль Xonotic/Quake-движков
+    103: 'KEY_UP', 108: 'KEY_DOWN', 105: 'KEY_LEFT', 106: 'KEY_RIGHT',
+    2: 'KEY_1', 3: 'KEY_2', 4: 'KEY_3', 5: 'KEY_4', 6: 'KEY_5',
+    7: 'KEY_6', 8: 'KEY_7', 9: 'KEY_8', 10: 'KEY_9', 11: 'KEY_0',
+    16: 'KEY_Q', 18: 'KEY_E', 19: 'KEY_R', 20: 'KEY_T', 21: 'KEY_Y',
+    25: 'KEY_P', 33: 'KEY_F', 34: 'KEY_G', 35: 'KEY_H',
+    44: 'KEY_Z', 45: 'KEY_X', 46: 'KEY_C', 47: 'KEY_V', 48: 'KEY_B',
 }
+
+# Для UInputBackend: если python-evdev не знает какое-то из наших имён (маловероятно,
+# но версии evdev отличаются), при создании устройства кинем понятную ошибку, а не
+# просто уроним KeyError где-то в середине.
+KEY_W = 17
 # (бит в button_mask, код кнопки, имя)
 MOUSE_BUTTONS = (
     (0x01, BTN_LEFT, 'BTN_LEFT'),
@@ -88,17 +99,18 @@ class UInputBackend:
     def __init__(self):
         from evdev import UInput, ecodes as e   # ленивый импорт: dry-run работает без evdev
 
-        # Проверка согласованности наших констант с python-evdev
-        expected = {
-            'KEY_W': KEY_W, 'KEY_A': KEY_A, 'KEY_S': KEY_S, 'KEY_D': KEY_D,
-            'KEY_SPACE': KEY_SPACE, 'KEY_LEFTSHIFT': KEY_LEFTSHIFT,
-            'BTN_LEFT': BTN_LEFT, 'BTN_RIGHT': BTN_RIGHT, 'BTN_MIDDLE': BTN_MIDDLE,
-            'REL_X': REL_X, 'REL_Y': REL_Y, 'REL_WHEEL': REL_WHEEL,
-        }
-        for name, value in expected.items():
-            actual = getattr(e, name)
-            if actual != value:
-                raise RuntimeError(f'{name}: в коде {value}, в python-evdev {actual}')
+        # Проверка согласованности наших кодов клавиш/кнопок с python-evdev: код у нас
+        # свой (KEYBOARD_KEYS ключуется числом), а имя (e.KEY_W и т.п.) берём из evdev —
+        # если версии разошлись, лучше явная ошибка при старте, чем немая рассинхронизация.
+        checks = dict(KEYBOARD_KEYS)
+        checks.update({BTN_LEFT: 'BTN_LEFT', BTN_RIGHT: 'BTN_RIGHT', BTN_MIDDLE: 'BTN_MIDDLE'})
+        checks.update({REL_X: 'REL_X', REL_Y: 'REL_Y', REL_WHEEL: 'REL_WHEEL'})
+        for code, name in checks.items():
+            actual = getattr(e, name, None)
+            if actual is None:
+                raise RuntimeError(f'python-evdev не знает {name} (обнови пакет evdev)')
+            if actual != code:
+                raise RuntimeError(f'{name}: в коде {code}, в python-evdev {actual}')
 
         self._e = e
         self._kb = UInput({e.EV_KEY: sorted(KEYBOARD_KEYS)}, name=KEYBOARD_NAME)

@@ -609,7 +609,21 @@ DEMO_PAGE = """
         // (input-event-codes.h). Мышь: pointer lock (клик по видео, Esc — выйти).
         // WebRTC Data Channel вместо POST — позже.
         // ------------------------------------------------------------------
-        const KEYMAP = { KeyW: 17, KeyA: 30, KeyS: 31, KeyD: 32, Space: 57, ShiftLeft: 42 };
+        const KEYMAP = {
+            // движение + модификаторы
+            KeyW: 17, KeyA: 30, KeyS: 31, KeyD: 32, Space: 57,
+            ShiftLeft: 42, ControlLeft: 29, AltLeft: 56,
+            // меню/консоль
+            Escape: 1, Enter: 28, Tab: 15, Backspace: 14, Backquote: 41,
+            ArrowUp: 103, ArrowDown: 108, ArrowLeft: 105, ArrowRight: 106,
+            // быстрое переключение оружия
+            Digit1: 2, Digit2: 3, Digit3: 4, Digit4: 5, Digit5: 6,
+            Digit6: 7, Digit7: 8, Digit8: 9, Digit9: 10, Digit0: 11,
+            // остальные буквы
+            KeyQ: 16, KeyE: 18, KeyR: 19, KeyT: 20, KeyY: 21, KeyP: 25,
+            KeyF: 33, KeyG: 34, KeyH: 35,
+            KeyZ: 44, KeyX: 45, KeyC: 46, KeyV: 47, KeyB: 48,
+        };
         const MOUSE_BIT = { 0: 1, 2: 2, 1: 4 };  // MouseEvent.button -> бит button_mask (left/right/middle)
         const inputEl = document.getElementById('input');
         const held = new Set();                  // KeyboardEvent.code зажатых клавиш
