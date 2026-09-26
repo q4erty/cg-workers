@@ -49,3 +49,14 @@ The worker is designed to run as a Docker container on a **Linux host**. Deploym
 - Elevated container capabilities for kernel device interaction.
 
 Detailed deployment instructions and configuration will be provided as the project matures.
+
+
+```bash
+docker run --rm -it --network host --device /dev/uinput --cap-add SYS_ADMIN \
+    -v "$(pwd)/workers/xonotic:/worker/workers/xonotic" xonotic-worker bash
+```
+
+```bash
+cd /worker
+bash run_xonotic.sh
+```

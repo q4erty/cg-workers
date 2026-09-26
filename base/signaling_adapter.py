@@ -9,8 +9,28 @@ Signaling Adapter (dev, non-trickle ICE) для GStreamer-воркера.
   POST /sdp      — приём SDP Offer, возврат SDP Answer
   POST /ice      — приём remote ICE candidate
   POST /input    — dev-ввод: {keys_down:[...], keys_up:[...], mouse:{dx,dy,buttons,wheel}}
-                   -> Protobuf PlayerInput -> Unix DGRAM socket Input Injector'а
-  POST /restart  — ICE Restart (заглушка)
+                   -> Protobuf PlayerInput -> Unix DGRAM socket Input Injector'а.
+                   Оставлен для curl/отладки; браузер использует Data Channel 'input'
+                   с тем же JSON — см. ниже.
+  POST /restart  — см. примечание про ICE Restart ниже
+
+WebRTC Data Channel (создаёт браузер, offerer — он же, до createOffer):
+  'input'   — ordered — тот же JSON, что и тело POST /input (одна из причин не
+              городить отдельный формат: код валидации и всё остальное общее).
+  'metrics' — unordered, maxRetransmits=0 — воркер раз в секунду шлёт JSON:
+              {"fps": N, "bitrate_kbps": N, "width": N, "height": N, "ts": ms}.
+              Точка отсчёта fps/bitrate — сам пайплайн (пробы на падах), а не
+              что там браузер реально получил, так что это не то же самое, что
+              getStats() на клиенте, а скорее «что воркер закодировал за секунду».
+
+Про ICE Restart:
+  В этой архитектуре offerer — браузер (worker только отвечает), поэтому
+  инициировать restart может только клиент: pc.restartIce() + новый createOffer()
+  + повторный POST /sdp на том же соединении. Серверный /restart-эндпоинт тут
+  нечего было бы делать — POST /restart ниже прямо это объясняет, а не
+  притворяется, что что-то реально перезапускает.
+  Повторный offer с тем же payload type переиспользует текущий webrtcbin (без
+  пересборки видео-пайплайна) — иначе каждый reconnect убивал бы data channels.
 
 Совместимость: Ubuntu 24.04 / GStreamer 1.24.x / Python 3.12.
 
@@ -35,6 +55,7 @@ Signaling Adapter (dev, non-trickle ICE) для GStreamer-воркера.
   KEY_LEFTSHIFT=42), а не JS-коды. Адаптер хранит состояние «что зажато» и шлёт
   инжектору snapshot; key-down/key-up генерирует уже инжектор.
 """
+import json
 import logging
 import os
 import re
@@ -51,7 +72,7 @@ from gi.repository import GLib, Gst, GstSdp, GstWebRTC
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from input_bridge import InputForwarder, InputUnavailable, load_proto
 
@@ -155,13 +176,48 @@ def _pick_h264_pt(offer_sdp: str) -> int | None:
     return best_pt
 
 
+class MetricsCollector:
+    """
+    Считает кадры и байты по пробам на падах пайплайна. Пробы вызываются
+    GStreamer'ом на потоке стриминга — не на GLib-потоке, откуда их потом читает
+    таймер метрик, — поэтому счётчики защищены локом.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._frames = 0
+        self._bytes = 0
+
+    def on_frame(self, _pad, _info):
+        with self._lock:
+            self._frames += 1
+        return Gst.PadProbeReturn.OK
+
+    def on_payload(self, _pad, info):
+        buf = info.get_buffer()
+        size = buf.get_size() if buf is not None else 0
+        with self._lock:
+            self._bytes += size
+        return Gst.PadProbeReturn.OK
+
+    def sample(self) -> tuple[int, int]:
+        """(кадров, байт) с прошлого вызова; счётчики обнуляются."""
+        with self._lock:
+            frames, nbytes = self._frames, self._bytes
+            self._frames = 0
+            self._bytes = 0
+        return frames, nbytes
+
+
 class WebRTCSession:
     """Один пайплайн с webrtcbin. Работает как answerer (браузер шлёт offer)."""
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._negotiated = False
         self._pt = DEFAULT_H264_PT
+        self.input_channel = None
+        self.metrics_channel = None
+        self._metrics_timer_id = None
         self._loop = GLib.MainLoop()
         threading.Thread(target=self._loop.run, daemon=True).start()
         self._build(DEFAULT_H264_PT)
@@ -170,8 +226,14 @@ class WebRTCSession:
         """Программная сборка пайплайна (обходит баги gst-parse)."""
         self._gathering_done = threading.Event()
         self._state = 'NEW'
-        self._negotiated = False
         self._pt = pt
+        # Пересобирается весь пайплайн — старые data channel-объекты (если были)
+        # принадлежат уничтоженному webrtcbin'у, они больше не рабочие.
+        self.input_channel = None
+        self.metrics_channel = None
+        if self._metrics_timer_id is not None:
+            GLib.source_remove(self._metrics_timer_id)
+            self._metrics_timer_id = None
 
         self.pipeline = Gst.Pipeline.new('cg-worker-pipeline')
 
@@ -237,10 +299,21 @@ class WebRTCSession:
         if ret != Gst.PadLinkReturn.OK:
             raise RuntimeError(f'Линк pay -> webrtcbin завершился с кодом {ret}')
 
+        # Метрики (раздел 2.4 дока): считаем кадры на сырых буферах (после конвертера,
+        # до энкодера — это и есть реальный fps пайплайна) и байты уже на RTP-payload'е
+        # (это и есть реальный исходящий битрейт в webrtcbin). Раз в секунду отдаём их
+        # в data channel 'metrics', см. _emit_metrics.
+        self._metrics = MetricsCollector()
+        self._video_src_pad = raw_caps.get_static_pad('src')
+        self._video_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._metrics.on_frame)
+        pay.get_static_pad('src').add_probe(Gst.PadProbeType.BUFFER, self._metrics.on_payload)
+        self._metrics_timer_id = GLib.timeout_add(1000, self._emit_metrics)
+
         # Сигналы webrtcbin
         self.webrtcbin.connect('on-ice-candidate', self._on_ice_candidate)
         self.webrtcbin.connect('notify::ice-gathering-state', self._on_gathering)
         self.webrtcbin.connect('notify::connection-state', self._on_connection_state)
+        self.webrtcbin.connect('on-data-channel', self._on_data_channel)
 
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
@@ -250,7 +323,7 @@ class WebRTCSession:
         log.info('Pipeline built (H.264 pt=%d), transitioning to PLAYING', pt)
 
     def _reset(self, pt: int):
-        """Пересобирает пайплайн (новая сессия или другой payload type)."""
+        """Пересобирает пайплайн (сменился payload type или предыдущий упал в ERROR)."""
         log.info('Resetting pipeline (pt=%d)', pt)
         self.pipeline.get_bus().remove_signal_watch()
         self.pipeline.set_state(Gst.State.NULL)
@@ -311,6 +384,66 @@ class WebRTCSession:
         state = bin.get_property('connection-state')
         log.info('Peer connection state: %s', state.value_nick)
 
+    def _on_data_channel(self, _webrtcbin, channel):
+        """Браузер создаёт оба канала до createOffer(); они приходят сюда при ответе."""
+        label = channel.get_property('label')
+        log.info('Data channel открыт: %s', label)
+        channel.connect('on-close', lambda _ch, l=label: log.info('Data channel закрыт: %s', l))
+        channel.connect('on-error', lambda _ch, err, l=label: log.warning('Data channel %s: ошибка %s', l, err))
+        if label == 'input':
+            self.input_channel = channel
+            channel.connect('on-message-string', self._on_input_message)
+        elif label == 'metrics':
+            self.metrics_channel = channel
+        else:
+            log.warning('Неизвестный data channel %r — игнорирую', label)
+
+    def _on_input_message(self, _channel, message: str):
+        """Ввод с data channel 'input' — тот же JSON, что тело POST /input."""
+        try:
+            body = json.loads(message)
+        except (TypeError, ValueError) as e:
+            log.warning('Input DC: не удалось разобрать JSON (%s): %r', e, message[:200])
+            return
+        try:
+            _apply_input(body)
+        except ValidationError as e:
+            log.warning('Input DC: невалидный payload: %s', e)
+        except InputUnavailable as e:
+            log.warning('Input DC: инжектор недоступен: %s', e)
+        except Exception:
+            log.exception('Input DC: ошибка обработки сообщения')
+
+    def _emit_metrics(self) -> bool:
+        """GLib-таймер, раз в секунду. Возврат True = 'вызывай меня снова'."""
+        channel = self.metrics_channel
+        if channel is None or self._state != 'PLAYING':
+            return GLib.SOURCE_CONTINUE
+        if channel.get_property('ready-state') != GstWebRTC.WebRTCDataChannelState.OPEN:
+            return GLib.SOURCE_CONTINUE
+
+        frames, nbytes = self._metrics.sample()
+        width = height = None
+        caps = self._video_src_pad.get_current_caps()
+        if caps is not None and caps.get_size() > 0:
+            s = caps.get_structure(0)
+            ok_w, w = s.get_int('width')
+            ok_h, h = s.get_int('height')
+            if ok_w and ok_h:
+                width, height = w, h
+
+        payload = json.dumps({
+            'fps': frames,                              # таймер тикает раз в секунду
+            'bitrate_kbps': round(nbytes * 8 / 1000, 1),
+            'width': width, 'height': height,
+            'ts': int(time.time() * 1000),
+        })
+        try:
+            channel.emit('send-string', payload)
+        except Exception:
+            log.exception('Metrics DC: send-string упал')
+        return GLib.SOURCE_CONTINUE
+
     def _on_bus_message(self, _bus, msg):
         if msg.type == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()
@@ -345,14 +478,17 @@ class WebRTCSession:
         log.info('Selected H.264 payload type from offer: %d', pt)
 
         with self._lock:
-            needs_reset = (
-                self._negotiated            # страница перезагрузилась
-                or self._state == 'ERROR'   # самовосстановление
-                or pt != self._pt           # другой pt, чем у текущего пайплайна
-            )
+            # Полная пересборка нужна, только когда её нельзя избежать: сменился payload
+            # type (нужно перенастроить rtph264pay) или предыдущий пайплайн упал в ERROR.
+            # Повторный offer с тем же pt — будь то перезагрузка страницы (новый
+            # RTCPeerConnection) или настоящий ICE restart (pc.restartIce() на том же
+            # соединении) — обрабатывается заново на ТОМ ЖЕ webrtcbin: set-remote-description
+            # с новым offer сам заводит новые ICE-креды и генерирует новые local-кандидаты.
+            # Это не только дешевле, но и не убивает уже открытые data channel'ы 'input'/
+            # 'metrics' на каждый reconnect.
+            needs_reset = self._state == 'ERROR' or pt != self._pt
             if needs_reset:
                 self._on_glib(lambda: self._reset(pt))
-            self._negotiated = True
             self._gathering_done.clear()
 
             self._wait_for_caps()
@@ -465,6 +601,23 @@ class InputRequest(BaseModel):
     heartbeat: bool = False
 
 
+def _apply_input(body: dict) -> dict:
+    """
+    Общая точка входа для ввода: валидирует dict тем же InputRequest, что и
+    POST /input, и передаёт в Input Injector. Используется и HTTP-эндпоинтом,
+    и обработчиком data channel 'input' — один код валидации на оба пути.
+    Поднимает pydantic.ValidationError / InputUnavailable / RuntimeError — их
+    разбирают уже вызывающие (HTTP отвечает статусом, DC-обработчик — логом).
+    """
+    req = InputRequest.model_validate(body)
+    return input_forwarder.submit(
+        keys_down=req.keys_down,
+        keys_up=req.keys_up,
+        mouse=req.mouse.model_dump() if req.mouse else None,
+        heartbeat=req.heartbeat,
+    )
+
+
 @app.get('/ready')
 def ready():
     """Readiness probe: возвращает 200 когда pipeline в PLAYING."""
@@ -502,16 +655,12 @@ def add_ice(req: ICERequest):
 @app.post('/input')
 def post_input(req: InputRequest):
     """
-    Dev-ввод (пока без WebRTC Data Channel). Конвертирует JSON в PlayerInput
-    и отправляет Input Injector'у через Unix DGRAM socket.
+    Ввод через обычный HTTP — для curl/отладки и как запасной путь, если data
+    channel 'input' почему-то не открылся. Браузер по умолчанию шлёт то же самое
+    через data channel (ниже задержка, не нужен отдельный TCP-хендшейк на пакет).
     """
     try:
-        return input_forwarder.submit(
-            keys_down=req.keys_down,
-            keys_up=req.keys_up,
-            mouse=req.mouse.model_dump() if req.mouse else None,
-            heartbeat=req.heartbeat,
-        )
+        return _apply_input(req.model_dump())
     except InputUnavailable as e:
         raise HTTPException(503, str(e))
     except RuntimeError as e:   # load_proto(): нет input_pb2 / grpcio-tools
@@ -521,10 +670,19 @@ def post_input(req: InputRequest):
 
 @app.post('/restart')
 def ice_restart():
-    """ICE Restart (заглушка для будущей интеграции с Java Signaling Server)."""
+    """
+    Не 'ICE Restart', который что-то делает на сервере — тут нечему: offerer в этой
+    архитектуре браузер, а не воркер, так что инициировать restart может только он.
+    Настоящий ICE restart — это со стороны клиента pc.restartIce() и повторный
+    createOffer() + POST /sdp на этом же соединении; handle_offer() уже умеет
+    переиспользовать текущий webrtcbin для такого повторного offer (см. docstring
+    модуля), не трогая data channel'ы. Этот эндпоинт оставлен, чтобы явно сказать
+    об этом вызывающему, а не молча возвращать 404.
+    """
     raise HTTPException(
         501,
-        'ICE Restart появится на этапе интеграции с Java Signaling Server'
+        'Серверного ICE Restart здесь нет: offerer — браузер. '
+        'Вызови pc.restartIce() + createOffer() и отправь новый offer на POST /sdp.'
     )
 
 
@@ -540,25 +698,48 @@ DEMO_PAGE = """
     <title>CG Worker dev stream</title>
     <style>
         body { margin: 0; background: #111; color: #eee; font-family: monospace; }
-        video { width: 100vw; height: 86vh; background: #000; cursor: crosshair; }
-        .line { padding: 6px 12px; font-size: 14px; }
+        video { width: 100vw; height: 82vh; background: #000; cursor: crosshair; }
+        .line { padding: 4px 12px; font-size: 14px; }
         #input { color: #8f8; }
+        #metrics { color: #6cf; }
     </style>
 </head>
 <body tabindex="0">
     <video id="v" autoplay playsinline muted></video>
     <div id="status" class="line">init…</div>
     <div id="input" class="line">input: —</div>
+    <div id="metrics" class="line">metrics: —</div>
     <script>
         const video = document.getElementById('v');
         const statusEl = document.getElementById('status');
+        const metricsEl = document.getElementById('metrics');
         const set = t => statusEl.textContent = t;
+
+        // Оба data channel создаём ДО createOffer() — так они попадают в первый же
+        // offer одним SDP-раундом, без отдельной renegotiation. 'input' ordered (нам
+        // важен порядок down/up), 'metrics' unordered+maxRetransmits=0 (свежее важнее
+        // полноты, отстающий пакет с fps никому не нужен).
+        let inputChannel = null;
+        let metricsChannel = null;
 
         async function start() {
             const pc = new RTCPeerConnection();   // localhost: STUN не нужен
             window.pc = pc;
 
-            // Без transceiver offer получается пустым (нет m-line)
+            inputChannel = pc.createDataChannel('input', { ordered: true });
+            metricsChannel = pc.createDataChannel('metrics', { ordered: false, maxRetransmits: 0 });
+
+            inputChannel.onopen = () => { set('input channel: open'); showInput(); };
+            inputChannel.onclose = () => showInput();
+            metricsChannel.onmessage = e => {
+                try {
+                    const m = JSON.parse(e.data);
+                    metricsEl.textContent = `metrics: ${m.fps} fps · ${m.bitrate_kbps} kbps` +
+                        (m.width ? ` · ${m.width}x${m.height}` : '');
+                } catch (err) { /* мусор в канале — просто игнорируем один кадр метрик */ }
+            };
+
+            // Без transceiver offer получается без видео m-line
             pc.addTransceiver('video', { direction: 'recvonly' });
 
             pc.ontrack = e => {
@@ -605,9 +786,10 @@ DEMO_PAGE = """
         start().catch(e => set('error: ' + e));
 
         // ------------------------------------------------------------------
-        // Ввод -> POST /input. Клавиши: KeyboardEvent.code -> Linux key code
-        // (input-event-codes.h). Мышь: pointer lock (клик по видео, Esc — выйти).
-        // WebRTC Data Channel вместо POST — позже.
+        // Ввод: KeyboardEvent.code -> Linux key code (input-event-codes.h).
+        // Мышь: pointer lock (клик по видео, Esc — выйти). Уходит через data
+        // channel 'input', пока он не открыт (первые доли секунды) — через
+        // POST /input, чтобы не терять нажатия в момент подключения.
         // ------------------------------------------------------------------
         const KEYMAP = {
             // движение + модификаторы
@@ -633,15 +815,27 @@ DEMO_PAGE = """
         function showInput() {
             const parts = [...held];
             if (mouseButtons) parts.push('mouse:' + mouseButtons);
-            inputEl.textContent = 'input: ' + (parts.length ? parts.join(' + ') : '—') +
+            const via = (inputChannel && inputChannel.readyState === 'open') ? 'DC' : 'HTTP';
+            inputEl.textContent = 'input[' + via + ']: ' + (parts.length ? parts.join(' + ') : '—') +
                 (locked() ? '   [мышь захвачена, Esc — отпустить]' : '   [клик по видео — захватить мышь]');
         }
         showInput();
 
-        // Запросы идут строго по очереди: иначе down и up могут обогнать друг друга
-        let queue = Promise.resolve();
+        // HTTP-путь — запасной (до открытия DC, или если DC вдруг отвалился). Запросы
+        // идут строго по очереди: иначе down и up могут обогнать друг друга. Сам DC
+        // ordered:true, ему такая очередь не нужна — там порядок гарантирует браузер.
+        let httpQueue = Promise.resolve();
         function sendInput(payload) {
-            queue = queue
+            if (inputChannel && inputChannel.readyState === 'open') {
+                try {
+                    inputChannel.send(JSON.stringify(payload));
+                    return;
+                } catch (e) {
+                    inputEl.textContent = 'input DC error, падаю на HTTP: ' + e;
+                    // не return — уходим в HTTP-путь ниже как запасной
+                }
+            }
+            httpQueue = httpQueue
                 .then(() => fetch('/input', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
